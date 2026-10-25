@@ -328,6 +328,123 @@ public class ReposiliteSidecarClient implements RepositorySidecarManager {
                         packageName, version))));
     }
 
+    /**
+     * One {@code /api/maven/details} response, split into what {@link #walkMavenDirectory} needs:
+     * which file names this directory holds directly, and which entries are subdirectories to
+     * possibly recurse into.
+     */
+    private record MavenDirectoryListing(List<String> fileNames, List<String> subdirectories) {}
+
+    /**
+     * Reposilite has no single list-everything endpoint (confirmed live: only the same one-level
+     * {@code /api/maven/details} directory listing {@link #listPackageVersionAssetNames}/{@link
+     * #listPackageVersions} already read one known directory at a time), so this walks the
+     * repository's directory tree from its root, recursing into {@code DIRECTORY} entries.
+     *
+     * <p>A plain groupId segment can never be told apart from the group/artifact directory itself
+     * by its own shape alone: both hold nothing but further {@code DIRECTORY} entries (confirmed
+     * live: {@code spike}'s own listing, one {@code DIRECTORY} entry named {@code 1.0.0}, looks
+     * identical in shape to {@code com}'s own listing, one {@code DIRECTORY} entry named {@code
+     * example}). What tells them apart is one level deeper: a version directory's own children are
+     * never further directories, only real files (or, after a {@code DisposePackageVersions}, none
+     * at all); a plain groupId segment's children always are.
+     *
+     * <p>Raised by Greptile's review: a real Maven coordinate layout can have both at the very same
+     * directory, since nothing stops one groupId from being a literal prefix of another's own
+     * segments (AWS's own worked example shape: {@code com:foo:1.0.0} and {@code com.foo:bar:1.0.0}
+     * share the real directory {@code com/foo}, one holding both a version directory {@code 1.0.0}
+     * and a further groupId segment {@code bar}). Peeking only one representative child, as an
+     * earlier version of this method did, answered only "is the current directory package-shaped
+     * or group-shaped", a false either/or that depended on which child happened to be peeked (or on
+     * {@code maven-metadata.xml}'s presence short-circuiting before any sibling was ever looked at
+     * either), silently dropping whichever of the two coordinates it didn't settle on. {@link
+     * #walkMavenDirectory} now checks every child of the current directory, not just one: a
+     * version-shaped child (no further directories) proves the current directory is itself a
+     * package, recorded at most once regardless of how many such children it has; a group-shaped
+     * child is recursed into as a further namespace segment, every time, independent of whether the
+     * current directory was already recorded. {@code maven-metadata.xml} still short-circuits
+     * straight to a record (covering a package {@link #recordVersionAvailable} was called for that
+     * happens to have zero version directories of its own, e.g. a {@code CopyPackageVersions}
+     * source whose every version failed), but no longer skips the sibling-child walk below it.
+     */
+    @Override
+    public List<PackageIdentifier> listPackages(String repositoryContainerId, String domain, String repository) {
+        String baseUrl = manager.ensureReady();
+        List<PackageIdentifier> result = new ArrayList<>();
+        walkMavenDirectory(baseUrl, "/api/maven/details/" + SidecarUriUtils.encodeSegment(repositoryContainerId)
+                + "/", List.of(), result);
+        return result;
+    }
+
+    private void walkMavenDirectory(String baseUrl, String detailsPath, List<String> pathSegments,
+            List<PackageIdentifier> result) {
+        MavenDirectoryListing listing = fetchMavenDirectoryListing(baseUrl, detailsPath);
+        if (listing == null) {
+            return;
+        }
+        boolean recordedAsPackage = false;
+        if (listing.fileNames().contains("maven-metadata.xml")) {
+            recordMavenPackage(pathSegments, result);
+            recordedAsPackage = true;
+        }
+        for (String subdirectory : listing.subdirectories()) {
+            String childPath = detailsPath + SidecarUriUtils.encodeSegment(subdirectory) + "/";
+            MavenDirectoryListing childListing = fetchMavenDirectoryListing(baseUrl, childPath);
+            if (childListing == null) {
+                continue;
+            }
+            if (childListing.subdirectories().isEmpty()) {
+                // This child holds no further directories of its own (real asset files, or none at
+                // all post-dispose): it is version-shaped, proving the current directory is (also)
+                // the group/artifact level itself, regardless of what its other children look like.
+                if (!recordedAsPackage) {
+                    recordMavenPackage(pathSegments, result);
+                    recordedAsPackage = true;
+                }
+                continue;
+            }
+            List<String> nextSegments = new ArrayList<>(pathSegments);
+            nextSegments.add(subdirectory);
+            walkMavenDirectory(baseUrl, childPath, nextSegments, result);
+        }
+    }
+
+    private void recordMavenPackage(List<String> pathSegments, List<PackageIdentifier> result) {
+        if (pathSegments.size() >= 2) {
+            String packageName = pathSegments.get(pathSegments.size() - 1);
+            String namespace = String.join(".", pathSegments.subList(0, pathSegments.size() - 1));
+            result.add(new PackageIdentifier(namespace, packageName));
+        }
+    }
+
+    private MavenDirectoryListing fetchMavenDirectoryListing(String baseUrl, String detailsPath) {
+        HttpRequest request = HttpRequest.newBuilder(SidecarUriUtils.combine(URI.create(baseUrl), detailsPath))
+                .timeout(Duration.ofSeconds(30))
+                .header("Authorization", manager.basicAuthHeader())
+                .GET()
+                .build();
+        HttpResponse<String> response = send(request, BodyHandlers.ofString());
+        if (response.statusCode() == 404) {
+            return null;
+        }
+        if (response.statusCode() != 200) {
+            throw new IllegalStateException("Could not list Maven packages on the Reposilite sidecar: upstream "
+                    + "returned " + response.statusCode());
+        }
+        List<String> fileNames = new ArrayList<>();
+        List<String> subdirectories = new ArrayList<>();
+        for (JsonNode entry : readTree(response.body()).path("files")) {
+            String type = entry.path("type").asText();
+            String name = entry.path("name").asText();
+            if ("FILE".equals(type)) {
+                fileNames.add(name);
+            } else if ("DIRECTORY".equals(type)) {
+                subdirectories.add(name);
+            }
+        }
+        return new MavenDirectoryListing(fileNames, subdirectories);
+    }
+
     private Instant latestFileTimestamp(String baseUrl, String versionDetailsPath) {
         HttpRequest request = HttpRequest.newBuilder(SidecarUriUtils.combine(URI.create(baseUrl), versionDetailsPath))
                 .timeout(Duration.ofSeconds(30))

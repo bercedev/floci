@@ -1221,6 +1221,44 @@ class ReposiliteSidecarClientTest {
                 new String(md5Body.get(), StandardCharsets.UTF_8));
     }
 
+    /**
+     * Raised by Greptile's review: {@code com/foo} is both {@code com:foo}'s own version directory
+     * ({@code 1.0.0}) and a further groupId segment for {@code com.foo:bar}'s own package
+     * ({@code bar}). {@code bar} is listed before {@code 1.0.0} here deliberately, since an earlier
+     * version of {@link ReposiliteSidecarClient#listPackages} peeked only the first child, so with
+     * {@code bar} first it fell through to treating every child (including the real version
+     * directory {@code 1.0.0}) as a further groupId segment, recursed into {@code 1.0.0} where it
+     * found no subdirectories and silently returned, and never recorded {@code com:foo} at all.
+     */
+    @Test
+    void listPackagesFindsBothAPackageAndASiblingGroupSharingItsDirectory() {
+        server.createContext("/api/maven/details/dom--repo/",
+                exchange -> respond(exchange, 200, "{\"name\":\"dom--repo\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"com\",\"type\":\"DIRECTORY\"}]}"));
+        server.createContext("/api/maven/details/dom--repo/com/",
+                exchange -> respond(exchange, 200, "{\"name\":\"com\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"foo\",\"type\":\"DIRECTORY\"}]}"));
+        server.createContext("/api/maven/details/dom--repo/com/foo/",
+                exchange -> respond(exchange, 200, "{\"name\":\"foo\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"bar\",\"type\":\"DIRECTORY\"},"
+                        + "{\"name\":\"1.0.0\",\"type\":\"DIRECTORY\"}]}"));
+        server.createContext("/api/maven/details/dom--repo/com/foo/1.0.0/",
+                exchange -> respond(exchange, 200, "{\"name\":\"1.0.0\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"foo-1.0.0.jar\",\"type\":\"FILE\"}]}"));
+        server.createContext("/api/maven/details/dom--repo/com/foo/bar/",
+                exchange -> respond(exchange, 200, "{\"name\":\"bar\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"1.0.0\",\"type\":\"DIRECTORY\"}]}"));
+        server.createContext("/api/maven/details/dom--repo/com/foo/bar/1.0.0/",
+                exchange -> respond(exchange, 200, "{\"name\":\"1.0.0\",\"type\":\"DIRECTORY\",\"files\":["
+                        + "{\"name\":\"bar-1.0.0.jar\",\"type\":\"FILE\"}]}"));
+
+        List<RepositorySidecarManager.PackageIdentifier> packages = client.listPackages("dom--repo", "dom", "repo");
+
+        assertThat(packages, containsInAnyOrder(
+                new RepositorySidecarManager.PackageIdentifier("com", "foo"),
+                new RepositorySidecarManager.PackageIdentifier("com.foo", "bar")));
+    }
+
     private static void respond(HttpExchange exchange, int status, String body) throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         exchange.sendResponseHeaders(status, bytes.length);
